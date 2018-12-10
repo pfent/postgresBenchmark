@@ -2,6 +2,30 @@
 #include <libpq-fe.h>
 #include "ycsb.h"
 #include <chrono>
+#include <memory>
+
+auto connect(const char* connection) {
+   auto res = PQconnectdb(connection);
+   return std::unique_ptr<PGconn, decltype(&PQfinish)>(res, &PQfinish);
+}
+
+auto exec(PGconn* connection, const char* query) {
+   auto res = PQexec(connection, query);
+   return std::unique_ptr<PGresult, decltype(&PQclear)>(res, &PQclear);
+}
+
+auto execPrepared(PGconn* connection, const char* stmtName, int nParams = 0, const char* const* paramValues = nullptr,
+                  const int* paramLengths = nullptr, const int* paramFormats = nullptr, int resultFormat = 0) {
+   auto res = PQexecPrepared(connection, stmtName, nParams, paramValues, paramLengths, paramFormats, resultFormat);
+   return std::unique_ptr<PGresult, decltype(&PQclear)>(res, &PQclear);
+}
+
+auto
+prepare(PGconn* connection, const char* stmtName, const char* query, int nParams = 0, const Oid* paramTypes = nullptr) {
+   auto res = PQprepare(connection, stmtName, query, nParams, paramTypes);
+   return std::unique_ptr<PGresult, decltype(&PQclear)>(res, &PQclear);
+}
+
 
 static auto db = YcsbDatabase();
 
@@ -24,8 +48,8 @@ void prepareYcsb(PGconn* postgres) {
    create += "v" + std::to_string(ycsb_field_count) + " CHAR(" + std::to_string(ycsb_field_length) + ") NOT NULL";
    create += ");";
 
-   if (auto res = PQexec(postgres, create.c_str());
-         PQresultStatus(res) != PGRES_COMMAND_OK) {
+   if (auto res = exec(postgres, create.c_str());
+         PQresultStatus(res.get()) != PGRES_COMMAND_OK) {
       throw std::runtime_error(std::string("CREATE TABLE failed: ") + PQerrorMessage(postgres));
    }
 
@@ -49,8 +73,8 @@ void prepareYcsb(PGconn* postgres) {
       statement.resize(statement.length() - 2); // remove last comma
       statement += ";";
 
-      if (auto res = PQexec(postgres, create.c_str());
-            PQresultStatus(res) != PGRES_COMMAND_OK) {
+      if (auto res = exec(postgres, statement.c_str());
+            PQresultStatus(res.get()) != PGRES_COMMAND_OK) {
          throw std::runtime_error(std::string("INSERT failed: ") + PQerrorMessage(postgres));
       }
    }
@@ -63,26 +87,25 @@ void doSmallTx(pg_conn* postgres) {
 
    std::cout << iterations << " very small prepared statements\n";
 
-   if (auto res = PQprepare(postgres, preparedStatement, "SELECT 1;", 0, nullptr);
-         PQresultStatus(res) != PGRES_COMMAND_OK) {
+   if (auto res = prepare(postgres, preparedStatement, "SELECT 1;", 0, nullptr);
+         PQresultStatus(res.get()) != PGRES_COMMAND_OK) {
       throw std::runtime_error(std::string("PQprepare failed: ") + PQerrorMessage(postgres));
    }
 
    const auto timeTaken = bench([&] {
       for (size_t i = 0; i < iterations; ++i) {
-         auto res = PQexecPrepared(postgres, preparedStatement, 0, nullptr, nullptr, nullptr, 0);
-         if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+         auto res = execPrepared(postgres, preparedStatement, 0, nullptr, nullptr, nullptr, 0);
+         if (PQresultStatus(res.get()) != PGRES_TUPLES_OK) {
             throw std::runtime_error(std::string("PQexecPrepared failed: ") + PQerrorMessage(postgres));
          }
 
-         if (PQntuples(res) != 1) {
+         if (PQntuples(res.get()) != 1) {
             throw std::runtime_error("Unexpected data returned");
          }
-         auto result = PQgetvalue(res, 0, 0);
+         auto result = PQgetvalue(res.get(), 0, 0);
          if (result[0] != '1') {
             throw std::runtime_error(std::string("Unexpected data returned: ") + result);
          }
-         PQclear(res);
       }
    });
 
@@ -93,37 +116,36 @@ void doLargeResultSet(pg_conn* /*postgres*/) {
    // TODO
 }
 
-int main(int argc, char** /*argv*/) {
+int main(int argc, char** argv) {
    if (argc < 3) {
       std::cout << "Usage: mySqlBenchmark <user> <password> <host> <database>\n";
       return 1;
    }
-   //auto user = argv[1];
-   //auto password = argv[2];
-   //auto host = argc > 3 ? argv[3] : nullptr;
-   //auto database = argc > 4 ? argv[4] : "mysql";
+   auto user = argv[1];
+   auto password = argv[2];
+   auto host = argc > 3 ? argv[3] : "127.0.0.1";
+   auto database = argc > 4 ? argv[4] : "mysql";
 
    auto connections = {
-         "TCP",
-         "SharedMemory",
-         "NamedPipe",
-         "Socket"
+         std::string("user=") + user + " password=" + password + " dbname=" + database + " hostaddr=" + host,
+         std::string("user=") + user + " password=" + password + " dbname=" +
+         database, // no hostaddr connects via socket
    };
 
-   for (auto connection : connections) {
+   for (const auto &connection : connections) {
       try {
-         // TODO postgres connect
-         auto postgres = PQconnectdb(connection);
-         if (PQstatus(postgres) == CONNECTION_BAD) {
-            throw std::runtime_error(std::string("Connection to database failed: ") + PQerrorMessage(postgres));
+         std::cout << "connecting with: " << connection << "...\n";
+         auto postgres = connect(connection.c_str());
+         if (PQstatus(postgres.get()) == CONNECTION_BAD) {
+            throw std::runtime_error(std::string("Connection to database failed: ") + PQerrorMessage(postgres.get()));
          }
+         std::cout << "connected to: " << PQhost(postgres.get()) << "\n";
 
          std::cout << "Preparing YCSB temporary table\n";
-         prepareYcsb(postgres);
+         prepareYcsb(postgres.get());
 
-         doSmallTx(postgres);
-         doLargeResultSet(postgres);
-         PQfinish(postgres);
+         doSmallTx(postgres.get());
+         doLargeResultSet(postgres.get());
       } catch (const std::runtime_error &e) {
          std::cout << e.what() << '\n';
       }
