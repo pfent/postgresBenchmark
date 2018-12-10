@@ -1,6 +1,7 @@
 #include <iostream>
 #include <libpq-fe.h>
 #include "ycsb.h"
+#include "util/doNotOptimize.h"
 #include <chrono>
 #include <memory>
 
@@ -81,39 +82,98 @@ void prepareYcsb(PGconn* postgres) {
    std::cout << "\n";
 }
 
-void doSmallTx(pg_conn* postgres) {
-   static constexpr auto iterations = size_t(1e6);
-   static constexpr auto preparedStatement = "smallTx";
+void doSmallTx(PGconn* postgres) {
+   auto rand = Random32();
+   const auto lookupKeys = generateZipfLookupKeys(ycsb_tx_count);
 
-   std::cout << iterations << " very small prepared statements\n";
+   std::cout << "benchmarking " << lookupKeys.size() << " small transactions" << '\n';
 
-   if (auto res = prepare(postgres, preparedStatement, "SELECT 1;", 0, nullptr);
-         PQresultStatus(res.get()) != PGRES_COMMAND_OK) {
-      throw std::runtime_error(std::string("PQprepare failed: ") + PQerrorMessage(postgres));
+   for (size_t i = 1; i < ycsb_field_count + 1; ++i) {
+      auto statement = std::string("SELECT v") + std::to_string(i) + " FROM Ycsb WHERE ycsb_key=$1;";
+      auto name = "v" + std::to_string(i);
+      if (auto res = prepare(postgres, name.c_str(), statement.c_str(), 1);
+            PQresultStatus(res.get()) != PGRES_COMMAND_OK) {
+         throw std::runtime_error(std::string("PQprepare failed: ") + PQerrorMessage(postgres));
+      }
    }
 
-   const auto timeTaken = bench([&] {
-      for (size_t i = 0; i < iterations; ++i) {
-         auto res = execPrepared(postgres, preparedStatement, 0, nullptr, nullptr, nullptr, 0);
+   // String to hold serialized YcsbKey
+   auto param = std::string();
+   param.reserve(sizeof("4294967295" /* uint32_t max */));
+   int paramFormat = 0;
+   auto expected = std::array<char, ycsb_field_length>();
+
+   auto timeTaken = bench([&] {
+      for (auto lookupKey: lookupKeys) {
+         auto which = rand.next() % ycsb_field_count;
+         auto statementName = "v" + std::to_string(which + 1); // ycsb names are 1 based
+
+         param = std::to_string(lookupKey);
+         auto paramBuf = param.data();
+         int paramBufLen = static_cast<int>(param.length());
+         auto res = execPrepared(postgres, statementName.c_str(), 1, &paramBuf, &paramBufLen, &paramFormat);
          if (PQresultStatus(res.get()) != PGRES_TUPLES_OK) {
             throw std::runtime_error(std::string("PQexecPrepared failed: ") + PQerrorMessage(postgres));
          }
 
          if (PQntuples(res.get()) != 1) {
-            throw std::runtime_error("Unexpected data returned");
+            throw std::runtime_error("Unexpected number of tuples: " + std::to_string(PQntuples(res.get())));
          }
+
+         if (PQnfields(res.get()) != 1) {
+            throw std::runtime_error("Unexpected number of fields: " + std::to_string(PQntuples(res.get())));
+         }
+
          auto result = PQgetvalue(res.get(), 0, 0);
-         if (result[0] != '1') {
-            throw std::runtime_error(std::string("Unexpected data returned: ") + result);
+         db.lookup(lookupKey, which, expected.begin());
+         if (not std::equal(expected.begin(), expected.end() - 1, result)) {
+            // result is whitespace terminated, while expected is \0 terminated -> ignore
+            throw std::runtime_error("unexpected result");
          }
       }
    });
 
-   std::cout << iterations / timeTaken << " msg/s\n";
+   std::cout << " " << lookupKeys.size() / timeTaken << " msg/s\n";
 }
 
-void doLargeResultSet(pg_conn* /*postgres*/) {
-   // TODO
+void doLargeResultSet(pg_conn* postgres) {
+   const auto resultSizeMB = static_cast<double>(ycsb_tuple_count) * ycsb_field_count * ycsb_field_length / 1024 / 1024;
+   std::cout << "benchmarking " << resultSizeMB << "MB data transfer" << '\n';
+
+   auto name = "s*";
+   if (auto res = prepare(postgres, name, "SELECT v1,v2,v3,v4,v5,v6,v7,v8,v9,v10 FROM Ycsb");
+         PQresultStatus(res.get()) != PGRES_COMMAND_OK) {
+      throw std::runtime_error(std::string("PQprepare failed: ") + PQerrorMessage(postgres));
+   }
+
+   auto result = std::array<std::array<char, ycsb_field_length>, ycsb_field_count>();
+
+   auto timeTaken = bench([&] {
+      auto res = execPrepared(postgres, name);
+      if (PQresultStatus(res.get()) != PGRES_TUPLES_OK) {
+         throw std::runtime_error(std::string("PQexecPrepared failed: ") + PQerrorMessage(postgres));
+      }
+
+      if (PQntuples(res.get()) != ycsb_tuple_count) {
+         throw std::runtime_error(std::string("Unexpected number of result tuples"));
+      }
+      if (PQnfields(res.get()) != ycsb_field_count) {
+         throw std::runtime_error(std::string("Unexpected number of result columns"));
+      }
+      for (int i = 0; i < static_cast<int>(ycsb_tuple_count); ++i) {
+         DoNotOptimize(result);
+         for (int j = 0; j < static_cast<int>(ycsb_field_count); ++j) {
+            auto value = PQgetvalue(res.get(), i, j);
+            auto resultIt = result[j].begin();
+            for (auto c = value; *c != '\0'; ++c, ++resultIt) {
+               *resultIt = *c;
+            }
+         }
+         ClobberMemory();
+      }
+   });
+
+   std::cout << " " << resultSizeMB / timeTaken << " MB/s\n";
 }
 
 int main(int argc, char** argv) {
