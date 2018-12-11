@@ -178,13 +178,13 @@ void doLargeResultSet(pg_conn* postgres) {
 
 int main(int argc, char** argv) {
    if (argc < 3) {
-      std::cout << "Usage: mySqlBenchmark <user> <password> <host> <database>\n";
+      std::cout << "Usage: postgresBenchmark <user> <password> <host> <database>\n";
       return 1;
    }
    auto user = argv[1];
    auto password = argv[2];
    auto host = argc > 3 ? argv[3] : "127.0.0.1";
-   auto database = argc > 4 ? argv[4] : "mysql";
+   auto database = argc > 4 ? argv[4] : "postgres";
 
    auto connections = {
          std::string("user=") + user + " password=" + password + " dbname=" + database + " hostaddr=" + host,

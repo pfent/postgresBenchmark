@@ -19,4 +19,5 @@ if ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU")
     set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g")
 endif ()
 
+target_include_directories(postgresBenchmark PUBLIC "/usr/include/postgresql")
 target_link_libraries(postgresBenchmark pq)
